@@ -1,0 +1,65 @@
+name: Publish latest simple-switchy rules
+
+on:
+  push:
+    branches:
+      - "**"
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-latest-release
+  cancel-in-progress: true
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Download rules.json
+        run: |
+          curl -fsSL \
+            "https://gist.githubusercontent.com/chenxiex/31268f8af084349c2cf684164756d41d/raw/rules.json" \
+            -o rules.json
+
+      - name: Convert to simple-switchy.sorl
+        run: |
+          python rules-converter.py rules.json simple-switchy.sorl \
+            --from-format xray \
+            --to-format simple-switchy
+
+      - name: Update latest tag
+        run: |
+          git tag -f latest
+          git push origin refs/tags/latest --force
+
+      - name: Ensure latest release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view latest > /dev/null 2>&1; then
+            gh release edit latest \
+              --title "latest" \
+              --notes "Auto-updated on $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          else
+            gh release create latest \
+              --title "latest" \
+              --notes "Auto-created on $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          fi
+
+      - name: Upload asset (replace existing)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload latest simple-switchy.sorl --clobber
