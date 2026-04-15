@@ -5,6 +5,12 @@ on:
     branches:
       - "**"
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Publish to latest release"
+        required: true
+        type: boolean
+        default: true
   schedule:
     - cron: "0 3 * * *"
 
@@ -39,12 +45,22 @@ jobs:
             --from-format xray \
             --to-format simple-switchy
 
+      - name: Upload artifact for non-release runs
+        if: (github.event_name == 'push' && github.ref != 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.publish_release != true)
+        uses: actions/upload-artifact@v4
+        with:
+          name: simple-switchy-${{ github.ref_name }}-${{ github.sha }}
+          path: simple-switchy.sorl
+          if-no-files-found: error
+
       - name: Update latest tag
+        if: github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true)
         run: |
           git tag -f latest
           git push origin refs/tags/latest --force
 
       - name: Ensure latest release exists
+        if: github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -59,6 +75,7 @@ jobs:
           fi
 
       - name: Upload asset (replace existing)
+        if: github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
