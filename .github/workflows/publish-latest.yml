@@ -47,7 +47,7 @@ jobs:
 
       - name: Upload artifact for non-release runs
         if: (github.event_name == 'push' && github.ref != 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.publish_release != true)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: simple-switchy-${{ github.ref_name }}-${{ github.sha }}
           path: simple-switchy.sorl
