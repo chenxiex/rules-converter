@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from datetime import date
 import json
 import re
 import urllib.request
@@ -271,6 +272,10 @@ def read_simple_switchy(input_path: Path) -> list[dict[str, Any]]:
         line = raw.strip()
         if not line:
             continue
+        if line.startswith("[") and line.endswith("]"):
+            continue
+        if line.startswith(";"):
+            continue
         if line.startswith("#"):
             raise ValueError(f"{input_path}:{idx}: simple-switchy does not support comments")
 
@@ -441,7 +446,14 @@ def write_switchy(rules: list[dict[str, Any]], output_path: Path) -> None:
 
 
 def write_simple_switchy(rules: list[dict[str, Any]], output_path: Path) -> None:
-    out_lines: list[str] = []
+    today = date.today()
+    out_lines: list[str] = [
+        "[SwitchyOmega Conditions]",
+        "; Require: ZeroOmega >= 2.3.2",
+        f"; Date: {today.year}/{today.month}/{today.day}",
+        "; Usage: https://github.com/FelisCatus/SwitchyOmega/wiki/RuleListUsage",
+        "",
+    ]
     geosite_cache: dict[str, list[str]] = {}
 
     for i, rule in enumerate(rules, start=1):
@@ -460,7 +472,7 @@ def write_simple_switchy(rules: list[dict[str, Any]], output_path: Path) -> None
             line = f"!{domain}" if outbound_tag == "direct" else domain
             out_lines.append(line)
 
-    output_path.write_text("\n".join(out_lines) + ("\n" if out_lines else ""), encoding="utf-8")
+    output_path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
 
 
 def detect_text_format(input_path: Path) -> str:
