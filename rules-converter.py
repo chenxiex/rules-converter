@@ -238,6 +238,10 @@ def read_switchy(input_path: Path) -> list[dict[str, Any]]:
         line = raw.strip()
         if not line:
             continue
+        if line.startswith("[") and line.endswith("]"):
+            continue
+        if line.startswith("@"):
+            continue
         if line.startswith("#"):
             raise ValueError(f"{input_path}:{idx}: switchy does not support comments")
 
@@ -423,7 +427,11 @@ def iter_domains_for_switchy_output(
 
 
 def write_switchy(rules: list[dict[str, Any]], output_path: Path) -> None:
-    out_lines: list[str] = []
+    out_lines: list[str] = [
+        "[SwitchyOmega Conditions]",
+        "@with result",
+        "",
+    ]
     geosite_cache: dict[str, list[str]] = {}
 
     for i, rule in enumerate(rules, start=1):
@@ -442,7 +450,7 @@ def write_switchy(rules: list[dict[str, Any]], output_path: Path) -> None:
         for domain in iter_domains_for_switchy_output(rule, geosite_cache):
             out_lines.append(f"{domain} +{outbound_tag}")
 
-    output_path.write_text("\n".join(out_lines) + ("\n" if out_lines else ""), encoding="utf-8")
+    output_path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
 
 
 def write_simple_switchy(rules: list[dict[str, Any]], output_path: Path) -> None:
