@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert between xray, routingA, switchy, simple-switchy, and seperate formats.
+"""Convert between xray, routingA, switchy, simple-switchy, and clash formats.
 
 xray format:
     JSON list of rule objects.
@@ -15,9 +15,9 @@ simple-switchy format (.sorl):
     !domain  # direct
     domain   # proxy (and any non-direct outboundTag)
 
-seperate format (output only):
+clash/seperate format (output only):
     An output directory containing one outboundTag.list file per outbound tag.
-    Each file contains that outbound tag's domains, one per line.
+    Each file is a Mihomo classical rule list without a policy field.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import csv
 from datetime import date
+import ipaddress
 import json
 import re
 import urllib.request
@@ -500,15 +501,198 @@ def validate_outbound_tag_filename(outbound_tag: str, rule_number: int) -> None:
         )
 
 
-def normalize_domain_for_seperate(domain: str) -> str:
-    if domain.startswith("*."):
-        return f"+.{domain[2:]}"
-    return domain
+CLASH_IGNORED_RULE_KEYS = {
+    "outboundTag",
+    "remarks",
+    "enabled",
+    "type",
+    "ruleTag",
+    "webhook",
+}
+
+
+def value_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    if isinstance(value, (str, int)):
+        return [str(value)]
+    return []
+
+
+def deduplicate(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(values))
+
+
+def collapse_clash_logic(operator: str, clauses: list[str]) -> str:
+    if len(clauses) == 1:
+        return clauses[0]
+    payloads = ",".join(f"({clause})" for clause in clauses)
+    return f"{operator},({payloads})"
+
+
+def domain_clash_clauses(value: Any) -> list[str]:
+    clauses: list[str] = []
+    for raw in value_list(value):
+        if not raw:
+            continue
+        if raw.startswith("full:"):
+            rule_type, payload = "DOMAIN", raw[len("full:") :]
+        elif raw.startswith("domain:"):
+            rule_type, payload = "DOMAIN-SUFFIX", raw[len("domain:") :]
+        elif raw.startswith(("keyword:", "plain:")):
+            prefix = raw.split(":", 1)[0] + ":"
+            rule_type, payload = "DOMAIN-KEYWORD", raw[len(prefix) :]
+        elif raw.startswith(("regexp:", "regex:")):
+            prefix = raw.split(":", 1)[0] + ":"
+            rule_type, payload = "DOMAIN-REGEX", raw[len(prefix) :]
+        elif raw.startswith("dotless:"):
+            keyword = raw[len("dotless:") :]
+            rule_type = "DOMAIN-REGEX"
+            payload = rf"^[^.]*{re.escape(keyword)}[^.]*$"
+        elif raw.startswith("geosite:"):
+            rule_type, payload = "GEOSITE", raw[len("geosite:") :]
+        elif raw.startswith("ext:") or raw.startswith("!"):
+            # Mihomo cannot reference Xray's external geosite files, and Xray
+            # does not define a generally compatible inverted domain syntax.
+            continue
+        else:
+            # An unprefixed Xray domain is a substring/keyword match.
+            rule_type, payload = "DOMAIN-KEYWORD", raw
+        if payload:
+            clauses.append(f"{rule_type},{payload}")
+    return deduplicate(clauses)
+
+
+def ip_clash_clause(raw: str, source: bool = False) -> str | None:
+    if raw.startswith("ext:"):
+        return None
+    if raw.startswith("geoip:"):
+        payload = raw[len("geoip:") :]
+        if not payload:
+            return None
+        return f"{'SRC-GEOIP' if source else 'GEOIP'},{payload.upper()}"
+
+    candidate = raw
+    try:
+        address = ipaddress.ip_address(candidate)
+        candidate = f"{candidate}/{'32' if address.version == 4 else '128'}"
+        version = address.version
+    except ValueError:
+        try:
+            version = ipaddress.ip_network(candidate, strict=False).version
+        except ValueError:
+            return None
+
+    if source:
+        rule_type = "SRC-IP-CIDR"
+    else:
+        rule_type = "IP-CIDR6" if version == 6 else "IP-CIDR"
+    return f"{rule_type},{candidate}"
+
+
+def ip_clash_clauses(value: Any, source: bool = False) -> list[str]:
+    positive: list[str] = []
+    negative: list[str] = []
+    for raw in value_list(value):
+        inverted = raw.startswith("!")
+        clause = ip_clash_clause(raw[1:] if inverted else raw, source=source)
+        if clause is None:
+            continue
+        if inverted:
+            negative.append(f"NOT,(({clause}))")
+        else:
+            positive.append(clause)
+
+    # Xray combines all inverse IP entries with AND, then ORs that result with
+    # every positive entry.
+    clauses = positive
+    if negative:
+        clauses.append(collapse_clash_logic("AND", negative))
+    return deduplicate(clauses)
+
+
+def simple_clash_clauses(rule_type: str, value: Any) -> list[str]:
+    return deduplicate(
+        [f"{rule_type},{item}" for item in value_list(value) if item]
+    )
+
+
+def port_clash_clauses(rule_type: str, value: Any) -> list[str]:
+    values = value_list(value)
+    if not values:
+        return []
+    # Both formats use '-' for ranges. Mihomo accepts '/' between alternatives,
+    # which avoids confusing those commas with the rule field separator.
+    payload = "/".join(
+        part.strip()
+        for item in values
+        for part in item.split(",")
+        if part.strip()
+    )
+    return [f"{rule_type},{payload}"] if payload else []
+
+
+def network_clash_clauses(value: Any) -> list[str]:
+    networks = [
+        part.strip().lower()
+        for item in value_list(value)
+        for part in item.split(",")
+        if part.strip().lower() in {"tcp", "udp"}
+    ]
+    return simple_clash_clauses("NETWORK", networks)
+
+
+def clash_condition_clauses(key: str, value: Any) -> list[str] | None:
+    converters = {
+        "domain": domain_clash_clauses,
+        "ip": ip_clash_clauses,
+        "port": lambda item: port_clash_clauses("DST-PORT", item),
+        "sourcePort": lambda item: port_clash_clauses("SRC-PORT", item),
+        "localPort": lambda item: port_clash_clauses("IN-PORT", item),
+        "network": network_clash_clauses,
+        "source": lambda item: ip_clash_clauses(item, source=True),
+        "sourceIP": lambda item: ip_clash_clauses(item, source=True),
+        "user": lambda item: simple_clash_clauses(
+            "IN-USER",
+            [entry for entry in value_list(item) if not entry.startswith("regexp:")],
+        ),
+        "inboundTag": lambda item: simple_clash_clauses("IN-NAME", item),
+        "process": lambda item: simple_clash_clauses(
+            "PROCESS-PATH",
+            [
+                entry
+                for entry in value_list(item)
+                if not entry.startswith(("self/", "xray/"))
+            ],
+        ),
+    }
+    converter = converters.get(key)
+    return converter(value) if converter else None
+
+
+def xray_rule_to_clash_lines(rule: dict[str, Any]) -> list[str]:
+    condition_groups: list[list[str]] = []
+    for key, value in rule.items():
+        if key in CLASH_IGNORED_RULE_KEYS:
+            continue
+        clauses = clash_condition_clauses(key, value)
+        if clauses is None or not clauses:
+            # Dropping an AND condition would broaden the rule, so omit the
+            # complete Xray rule when that condition cannot be represented.
+            return []
+        condition_groups.append(clauses)
+
+    if not condition_groups:
+        return []
+    if len(condition_groups) == 1:
+        return condition_groups[0]
+
+    conditions = [collapse_clash_logic("OR", group) for group in condition_groups]
+    return [collapse_clash_logic("AND", conditions)]
 
 
 def write_seperate(rules: list[dict[str, Any]], output_path: Path) -> None:
-    domains_by_tag: dict[str, list[str]] = {}
-    geosite_cache: dict[str, list[str]] = {}
+    lines_by_tag: dict[str, list[str]] = {}
 
     for i, rule in enumerate(rules, start=1):
         if not isinstance(rule, dict):
@@ -523,20 +707,19 @@ def write_seperate(rules: list[dict[str, Any]], output_path: Path) -> None:
             raise ValueError(f"Rule #{i} must include non-empty outboundTag")
         validate_outbound_tag_filename(outbound_tag, i)
 
-        domains = [
-            normalize_domain_for_seperate(domain)
-            for domain in iter_domains_for_switchy_output(rule, geosite_cache)
-        ]
-        if domains:
-            domains_by_tag.setdefault(outbound_tag, []).extend(domains)
+        lines = xray_rule_to_clash_lines(rule)
+        if lines:
+            lines_by_tag.setdefault(outbound_tag, []).extend(lines)
 
     if output_path.exists() and not output_path.is_dir():
-        raise ValueError(f"seperate output path must be a directory: {output_path}")
+        raise ValueError(
+            f"clash/seperate output path must be a directory: {output_path}"
+        )
     output_path.mkdir(parents=True, exist_ok=True)
 
-    for outbound_tag, domains in domains_by_tag.items():
+    for outbound_tag, lines in lines_by_tag.items():
         list_path = output_path / f"{outbound_tag}.list"
-        list_path.write_text("\n".join(domains) + "\n", encoding="utf-8")
+        list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def detect_text_format(input_path: Path) -> str:
@@ -605,7 +788,7 @@ def write_rules(rules: list[dict[str, Any]], output_path: Path, fmt: str) -> Non
     if fmt == "simple-switchy":
         write_simple_switchy(rules, output_path)
         return
-    if fmt == "seperate":
+    if fmt in {"clash", "seperate"}:
         write_seperate(rules, output_path)
         return
     raise ValueError(f"Unsupported output format: {fmt}")
@@ -623,11 +806,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Convert between xray, routingA, switchy, simple-switchy, "
-            "and seperate formats"
+            "and clash/seperate formats"
         )
     )
     parser.add_argument("input", help="Input file path")
-    parser.add_argument("output", help="Output file path, or directory for seperate")
+    parser.add_argument("output", help="Output file path, or directory for clash/seperate")
     parser.add_argument(
         "--from-format",
         choices=["auto", "xray", "routingA", "switchy", "simple-switchy"],
@@ -642,10 +825,14 @@ def build_parser() -> argparse.ArgumentParser:
             "routingA",
             "switchy",
             "simple-switchy",
+            "clash",
             "seperate",
         ],
         default="auto",
-        help="Output format; seperate writes outboundTag.list files to a directory",
+        help=(
+            "Output format; clash (also spelled seperate for compatibility) "
+            "writes outboundTag.list files to a directory"
+        ),
     )
     return parser
 
