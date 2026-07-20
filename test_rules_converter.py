@@ -96,7 +96,7 @@ class ClashOutputTests(unittest.TestCase):
     def test_omits_dst_port_catch_all(self) -> None:
         self.assertEqual(
             rules_converter.xray_rule_to_clash_lines(
-                {"outboundTag": "proxy", "port": "0-65536"}
+                {"outboundTag": "proxy", "port": "0-65535"}
             ),
             [],
         )
@@ -105,11 +105,26 @@ class ClashOutputTests(unittest.TestCase):
                 {
                     "outboundTag": "proxy",
                     "domain": ["domain:example.com"],
-                    "port": "0-65536",
+                    "port": "0-65535",
                 }
             ),
             ["DOMAIN-SUFFIX,example.com"],
         )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir)
+            rules_converter.write_clash(
+                [
+                    {
+                        "outboundTag": "direct",
+                        "domain": ["domain:example.com"],
+                    },
+                    {"outboundTag": "direct", "port": "0-65535"},
+                ],
+                output,
+            )
+            direct = (output / "direct.yaml").read_text(encoding="utf-8")
+            self.assertNotIn("DST-PORT,0-65535", direct)
 
 
 if __name__ == "__main__":

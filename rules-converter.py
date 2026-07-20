@@ -634,7 +634,7 @@ def port_clash_clauses(rule_type: str, value: Any) -> list[str]:
 
 def is_dst_port_catch_all(value: Any) -> bool:
     return any(
-        part.strip() == "0-65536"
+        part.strip() == "0-65535"
         for item in value_list(value)
         for part in item.split(",")
     )
@@ -686,7 +686,7 @@ def xray_rule_to_clash_lines(rule: dict[str, Any]) -> list[str]:
         if key == "port" and is_dst_port_catch_all(value):
             # Xray exports sometimes include this as a final catch-all. It is
             # redundant in a per-outbound classical rule list and must not be
-            # emitted as DST-PORT,0-65536.
+            # emitted as DST-PORT,0-65535.
             continue
         clauses = clash_condition_clauses(key, value)
         if clauses is None or not clauses:
