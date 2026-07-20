@@ -1,4 +1,4 @@
-name: Publish latest simple-switchy rules
+name: Build and publish converted rules
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       publish_release:
-        description: "Publish to latest release"
+        description: "Publish all converted rule files to the latest release"
         required: true
         type: boolean
         default: true
@@ -18,11 +18,12 @@ permissions:
   contents: write
 
 concurrency:
-  group: publish-latest-release
+  group: publish-latest-rules
   cancel-in-progress: true
 
 jobs:
   build-and-release:
+    name: Build rule files and update release
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -39,18 +40,22 @@ jobs:
             "https://gist.githubusercontent.com/chenxiex/31268f8af084349c2cf684164756d41d/raw/rules.json" \
             -o rules.json
 
-      - name: Convert to simple-switchy.sorl
+      - name: Generate release files
         run: |
-          python rules-converter.py rules.json simple-switchy.sorl \
+          mkdir -p release
+          python rules-converter.py rules.json release/simple-switchy.sorl \
             --from-format xray \
             --to-format simple-switchy
+          python rules-converter.py rules.json release \
+            --from-format xray \
+            --to-format seperate
 
-      - name: Upload artifact for non-release runs
+      - name: Upload converted rules for non-release runs
         if: (github.event_name == 'push' && github.ref != 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.publish_release != true)
         uses: actions/upload-artifact@v7
         with:
-          name: simple-switchy-${{ github.ref_name }}-${{ github.sha }}
-          path: simple-switchy.sorl
+          name: converted-rules-${{ github.ref_name }}-${{ github.sha }}
+          path: release/*
           if-no-files-found: error
 
       - name: Update latest tag
@@ -59,24 +64,24 @@ jobs:
           git tag -f latest
           git push origin refs/tags/latest --force
 
-      - name: Ensure latest release exists
+      - name: Create or update latest rules release
         if: github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           if gh release view latest > /dev/null 2>&1; then
             gh release edit latest \
-              --title "latest" \
-              --notes "Auto-updated on $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+              --title "Latest converted rules" \
+              --notes "Automatically updated rule files in simple-switchy and seperate formats. Updated on $(date -u +'%Y-%m-%d %H:%M:%S UTC')."
           else
             gh release create latest \
-              --title "latest" \
-              --notes "Auto-created on $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+              --title "Latest converted rules" \
+              --notes "Automatically generated rule files in simple-switchy and seperate formats. Created on $(date -u +'%Y-%m-%d %H:%M:%S UTC')."
           fi
 
-      - name: Upload asset (replace existing)
+      - name: Upload rule files to release
         if: github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload latest simple-switchy.sorl --clobber
+          gh release upload latest release/* --clobber

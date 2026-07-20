@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert between xray, routingA, switchy, and simple-switchy rule formats.
+"""Convert between xray, routingA, switchy, simple-switchy, and seperate formats.
 
 xray format:
     JSON list of rule objects.
@@ -14,6 +14,10 @@ switchy format:
 simple-switchy format (.sorl):
     !domain  # direct
     domain   # proxy (and any non-direct outboundTag)
+
+seperate format (output only):
+    An output directory containing one outboundTag.list file per outbound tag.
+    Each file contains that outbound tag's domains, one per line.
 """
 
 from __future__ import annotations
@@ -483,6 +487,58 @@ def write_simple_switchy(rules: list[dict[str, Any]], output_path: Path) -> None
     output_path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
 
 
+def validate_outbound_tag_filename(outbound_tag: str, rule_number: int) -> None:
+    if (
+        outbound_tag in {".", ".."}
+        or "/" in outbound_tag
+        or "\\" in outbound_tag
+        or "\0" in outbound_tag
+    ):
+        raise ValueError(
+            f"Rule #{rule_number} outboundTag cannot be used as a filename: "
+            f"{outbound_tag!r}"
+        )
+
+
+def normalize_domain_for_seperate(domain: str) -> str:
+    if domain.startswith("*."):
+        return f"+.{domain[2:]}"
+    return domain
+
+
+def write_seperate(rules: list[dict[str, Any]], output_path: Path) -> None:
+    domains_by_tag: dict[str, list[str]] = {}
+    geosite_cache: dict[str, list[str]] = {}
+
+    for i, rule in enumerate(rules, start=1):
+        if not isinstance(rule, dict):
+            raise ValueError(f"Rule #{i} must be an object")
+
+        enabled = rule.get("enabled", True)
+        if enabled is False:
+            continue
+
+        outbound_tag = rule.get("outboundTag")
+        if not isinstance(outbound_tag, str) or not outbound_tag:
+            raise ValueError(f"Rule #{i} must include non-empty outboundTag")
+        validate_outbound_tag_filename(outbound_tag, i)
+
+        domains = [
+            normalize_domain_for_seperate(domain)
+            for domain in iter_domains_for_switchy_output(rule, geosite_cache)
+        ]
+        if domains:
+            domains_by_tag.setdefault(outbound_tag, []).extend(domains)
+
+    if output_path.exists() and not output_path.is_dir():
+        raise ValueError(f"seperate output path must be a directory: {output_path}")
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    for outbound_tag, domains in domains_by_tag.items():
+        list_path = output_path / f"{outbound_tag}.list"
+        list_path.write_text("\n".join(domains) + "\n", encoding="utf-8")
+
+
 def detect_text_format(input_path: Path) -> str:
     lines = input_path.read_text(encoding="utf-8").splitlines()
     for raw in lines:
@@ -549,6 +605,9 @@ def write_rules(rules: list[dict[str, Any]], output_path: Path, fmt: str) -> Non
     if fmt == "simple-switchy":
         write_simple_switchy(rules, output_path)
         return
+    if fmt == "seperate":
+        write_seperate(rules, output_path)
+        return
     raise ValueError(f"Unsupported output format: {fmt}")
 
 
@@ -562,10 +621,13 @@ def resolve_formats(input_path: Path, output_path: Path, from_format: str, to_fo
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Convert between xray, routingA, switchy, and simple-switchy formats"
+        description=(
+            "Convert between xray, routingA, switchy, simple-switchy, "
+            "and seperate formats"
+        )
     )
     parser.add_argument("input", help="Input file path")
-    parser.add_argument("output", help="Output file path")
+    parser.add_argument("output", help="Output file path, or directory for seperate")
     parser.add_argument(
         "--from-format",
         choices=["auto", "xray", "routingA", "switchy", "simple-switchy"],
@@ -574,9 +636,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--to-format",
-        choices=["auto", "xray", "routingA", "switchy", "simple-switchy"],
+        choices=[
+            "auto",
+            "xray",
+            "routingA",
+            "switchy",
+            "simple-switchy",
+            "seperate",
+        ],
         default="auto",
-        help="Output format (default: auto)",
+        help="Output format; seperate writes outboundTag.list files to a directory",
     )
     return parser
 
