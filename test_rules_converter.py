@@ -12,13 +12,13 @@ SPEC.loader.exec_module(rules_converter)
 
 
 class ClashOutputTests(unittest.TestCase):
-    def test_clash_alias_is_available(self) -> None:
+    def test_clash_format_is_available(self) -> None:
         args = rules_converter.build_parser().parse_args(
             ["input.json", "output", "--to-format", "clash"]
         )
         self.assertEqual(args.to_format, "clash")
 
-    def test_writes_classical_lists_without_outbound_tag(self) -> None:
+    def test_writes_classical_yaml_without_outbound_tag(self) -> None:
         rules = [
             {
                 "outboundTag": "proxy",
@@ -45,23 +45,25 @@ class ClashOutputTests(unittest.TestCase):
             rules_converter.write_rules(rules, output, "clash")
 
             self.assertEqual(
-                (output / "proxy.list").read_text(encoding="utf-8").splitlines(),
+                (output / "proxy.yaml").read_text(encoding="utf-8").splitlines(),
                 [
-                    "DOMAIN,api.example.com",
-                    "DOMAIN-SUFFIX,example.com",
-                    "DOMAIN-KEYWORD,example",
-                    r"DOMAIN-REGEX,^www\d+\.example\.com$",
-                    "GEOSITE,google",
+                    "payload:",
+                    '  - "DOMAIN,api.example.com"',
+                    '  - "DOMAIN-SUFFIX,example.com"',
+                    '  - "DOMAIN-KEYWORD,example"',
+                    r'  - "DOMAIN-REGEX,^www\\d+\\.example\\.com$"',
+                    '  - "GEOSITE,google"',
                 ],
             )
-            direct = (output / "direct.list").read_text(encoding="utf-8")
+            direct = (output / "direct.yaml").read_text(encoding="utf-8")
             self.assertEqual(
                 direct.splitlines(),
                 [
-                    "IP-CIDR,127.0.0.1/32",
-                    "IP-CIDR6,2001:db8::/32",
-                    "GEOIP,CN",
-                    "DST-PORT,53/443/1000-2000",
+                    "payload:",
+                    '  - "IP-CIDR,127.0.0.1/32"',
+                    '  - "IP-CIDR6,2001:db8::/32"',
+                    '  - "GEOIP,CN"',
+                    '  - "DST-PORT,53/443/1000-2000"',
                 ],
             )
             self.assertNotIn("direct", direct)
@@ -90,6 +92,24 @@ class ClashOutputTests(unittest.TestCase):
             "protocol": ["bittorrent"],
         }
         self.assertEqual(rules_converter.xray_rule_to_clash_lines(rule), [])
+
+    def test_omits_dst_port_catch_all(self) -> None:
+        self.assertEqual(
+            rules_converter.xray_rule_to_clash_lines(
+                {"outboundTag": "proxy", "port": "0-65536"}
+            ),
+            [],
+        )
+        self.assertEqual(
+            rules_converter.xray_rule_to_clash_lines(
+                {
+                    "outboundTag": "proxy",
+                    "domain": ["domain:example.com"],
+                    "port": "0-65536",
+                }
+            ),
+            ["DOMAIN-SUFFIX,example.com"],
+        )
 
 
 if __name__ == "__main__":

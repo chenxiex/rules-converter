@@ -15,9 +15,9 @@ simple-switchy format (.sorl):
     !domain  # direct
     domain   # proxy (and any non-direct outboundTag)
 
-clash/seperate format (output only):
-    An output directory containing one outboundTag.list file per outbound tag.
-    Each file is a Mihomo classical rule list without a policy field.
+clash format (output only):
+    An output directory containing one outboundTag.yaml file per outbound tag.
+    Each file is a Mihomo classical rule-provider YAML file without policy fields.
 """
 
 from __future__ import annotations
@@ -632,6 +632,14 @@ def port_clash_clauses(rule_type: str, value: Any) -> list[str]:
     return [f"{rule_type},{payload}"] if payload else []
 
 
+def is_dst_port_catch_all(value: Any) -> bool:
+    return any(
+        part.strip() == "0-65536"
+        for item in value_list(value)
+        for part in item.split(",")
+    )
+
+
 def network_clash_clauses(value: Any) -> list[str]:
     networks = [
         part.strip().lower()
@@ -675,6 +683,11 @@ def xray_rule_to_clash_lines(rule: dict[str, Any]) -> list[str]:
     for key, value in rule.items():
         if key in CLASH_IGNORED_RULE_KEYS:
             continue
+        if key == "port" and is_dst_port_catch_all(value):
+            # Xray exports sometimes include this as a final catch-all. It is
+            # redundant in a per-outbound classical rule list and must not be
+            # emitted as DST-PORT,0-65536.
+            continue
         clauses = clash_condition_clauses(key, value)
         if clauses is None or not clauses:
             # Dropping an AND condition would broaden the rule, so omit the
@@ -691,7 +704,7 @@ def xray_rule_to_clash_lines(rule: dict[str, Any]) -> list[str]:
     return [collapse_clash_logic("AND", conditions)]
 
 
-def write_seperate(rules: list[dict[str, Any]], output_path: Path) -> None:
+def write_clash(rules: list[dict[str, Any]], output_path: Path) -> None:
     lines_by_tag: dict[str, list[str]] = {}
 
     for i, rule in enumerate(rules, start=1):
@@ -712,14 +725,18 @@ def write_seperate(rules: list[dict[str, Any]], output_path: Path) -> None:
             lines_by_tag.setdefault(outbound_tag, []).extend(lines)
 
     if output_path.exists() and not output_path.is_dir():
-        raise ValueError(
-            f"clash/seperate output path must be a directory: {output_path}"
-        )
+        raise ValueError(f"clash output path must be a directory: {output_path}")
     output_path.mkdir(parents=True, exist_ok=True)
 
     for outbound_tag, lines in lines_by_tag.items():
-        list_path = output_path / f"{outbound_tag}.list"
-        list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        yaml_path = output_path / f"{outbound_tag}.yaml"
+        yaml_lines = ["payload:"]
+        # JSON strings are valid YAML double-quoted scalars and safely preserve
+        # regular expressions, Windows paths, '#' and other YAML indicators.
+        yaml_lines.extend(
+            f"  - {json.dumps(line, ensure_ascii=False)}" for line in lines
+        )
+        yaml_path.write_text("\n".join(yaml_lines) + "\n", encoding="utf-8")
 
 
 def detect_text_format(input_path: Path) -> str:
@@ -788,8 +805,8 @@ def write_rules(rules: list[dict[str, Any]], output_path: Path, fmt: str) -> Non
     if fmt == "simple-switchy":
         write_simple_switchy(rules, output_path)
         return
-    if fmt in {"clash", "seperate"}:
-        write_seperate(rules, output_path)
+    if fmt == "clash":
+        write_clash(rules, output_path)
         return
     raise ValueError(f"Unsupported output format: {fmt}")
 
@@ -806,11 +823,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Convert between xray, routingA, switchy, simple-switchy, "
-            "and clash/seperate formats"
+            "and clash formats"
         )
     )
     parser.add_argument("input", help="Input file path")
-    parser.add_argument("output", help="Output file path, or directory for clash/seperate")
+    parser.add_argument("output", help="Output file path, or directory for clash")
     parser.add_argument(
         "--from-format",
         choices=["auto", "xray", "routingA", "switchy", "simple-switchy"],
@@ -826,13 +843,9 @@ def build_parser() -> argparse.ArgumentParser:
             "switchy",
             "simple-switchy",
             "clash",
-            "seperate",
         ],
         default="auto",
-        help=(
-            "Output format; clash (also spelled seperate for compatibility) "
-            "writes outboundTag.list files to a directory"
-        ),
+        help="Output format; clash writes outboundTag.yaml files to a directory",
     )
     return parser
 
