@@ -49,6 +49,9 @@ jobs:
           python rules-converter.py rules.json release \
             --from-format xray \
             --to-format clash
+          python rules-converter.py rules.json release/clash.yaml \
+            --from-format xray \
+            --to-format clash-single
 
       - name: Upload converted rules for non-release runs
         if: (github.event_name == 'push' && github.ref != 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.publish_release != true)
@@ -72,11 +75,11 @@ jobs:
           if gh release view latest > /dev/null 2>&1; then
             gh release edit latest \
               --title "Latest converted rules" \
-              --notes "Automatically updated rule files in simple-switchy and clash formats. Updated on $(date -u +'%Y-%m-%d %H:%M:%S UTC')."
+              --notes "Automatically updated rule files in simple-switchy, clash, and clash-single formats. Updated on $(date -u +'%Y-%m-%d %H:%M:%S UTC')."
           else
             gh release create latest \
               --title "Latest converted rules" \
-              --notes "Automatically generated rule files in simple-switchy and clash formats. Created on $(date -u +'%Y-%m-%d %H:%M:%S UTC')."
+              --notes "Automatically generated rule files in simple-switchy, clash, and clash-single formats. Created on $(date -u +'%Y-%m-%d %H:%M:%S UTC')."
           fi
 
       - name: Upload rule files to release

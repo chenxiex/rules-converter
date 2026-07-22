@@ -127,5 +127,147 @@ class ClashOutputTests(unittest.TestCase):
             self.assertNotIn("DST-PORT,0-65535", direct)
 
 
+class ClashSingleTests(unittest.TestCase):
+    def test_format_is_available_for_input_and_output(self) -> None:
+        args = rules_converter.build_parser().parse_args(
+            [
+                "input.yaml",
+                "output.json",
+                "--from-format",
+                "clash-single",
+            ]
+        )
+        self.assertEqual(args.from_format, "clash-single")
+
+        args = rules_converter.build_parser().parse_args(
+            ["input.json", "output.yaml", "--to-format", "clash-single"]
+        )
+        self.assertEqual(args.to_format, "clash-single")
+
+    def test_writes_one_rules_file_with_mapped_policies(self) -> None:
+        rules = [
+            {
+                "outboundTag": "proxy",
+                "domain": ["full:api.example.com", "domain:example.com"],
+            },
+            {"outboundTag": "direct", "ip": ["127.0.0.1"]},
+            {"outboundTag": "block", "domain": ["keyword:ads"]},
+            {"outboundTag": "Work Group", "network": "udp"},
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "rules.yaml"
+            rules_converter.write_rules(rules, output, "clash-single")
+            self.assertEqual(
+                output.read_text(encoding="utf-8").splitlines(),
+                [
+                    "rules:",
+                    '  - "DOMAIN,api.example.com,PROXY"',
+                    '  - "DOMAIN-SUFFIX,example.com,PROXY"',
+                    '  - "IP-CIDR,127.0.0.1/32,DIRECT"',
+                    '  - "DOMAIN-KEYWORD,ads,REJECT"',
+                    '  - "NETWORK,udp,Work Group"',
+                ],
+            )
+
+    def test_reads_rules_and_maps_policies_to_outbound_tags(self) -> None:
+        content = """\
+rules:
+- DOMAIN,api.example.com,PROXY
+- 'DOMAIN-SUFFIX,example.com,DIRECT'
+- "GEOIP,CN,REJECT"
+- DST-PORT,53/443,Custom Group
+"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "rules.yaml"
+            input_path.write_text(content, encoding="utf-8")
+            self.assertEqual(
+                rules_converter.read_rules(input_path, "clash-single"),
+                [
+                    {
+                        "outboundTag": "proxy",
+                        "domain": ["full:api.example.com"],
+                        "enabled": True,
+                    },
+                    {
+                        "outboundTag": "direct",
+                        "domain": ["domain:example.com"],
+                        "enabled": True,
+                    },
+                    {
+                        "outboundTag": "block",
+                        "ip": ["geoip:cn"],
+                        "enabled": True,
+                    },
+                    {
+                        "outboundTag": "Custom Group",
+                        "port": "53,443",
+                        "enabled": True,
+                    },
+                ],
+            )
+
+    def test_round_trips_generated_logical_rule(self) -> None:
+        source_rule = {
+            "outboundTag": "proxy",
+            "domain": ["domain:example.com", "geosite:google"],
+            "ip": ["geoip:telegram", "!geoip:cn", "!geoip:us"],
+            "network": "tcp",
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "rules.yaml"
+            rules_converter.write_clash_single([source_rule], output)
+            self.assertEqual(
+                rules_converter.read_clash_single(output),
+                [{**source_rule, "enabled": True}],
+            )
+
+    def test_preserves_rule_order_and_writes_catch_all_as_match(self) -> None:
+        rules = [
+            {
+                "outboundTag": "proxy",
+                "domain": ["domain:example.com"],
+            },
+            {"outboundTag": "direct", "port": "0-65535"},
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "rules.yaml"
+            rules_converter.write_clash_single(rules, output)
+            self.assertEqual(
+                output.read_text(encoding="utf-8").splitlines(),
+                [
+                    "rules:",
+                    '  - "DOMAIN-SUFFIX,example.com,PROXY"',
+                    '  - "MATCH,DIRECT"',
+                ],
+            )
+
+    def test_writes_conditionless_and_routing_all_rules_as_match(self) -> None:
+        rules = [
+            {"outboundTag": "proxy"},
+            {"outboundTag": "block", "all": []},
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "rules.yaml"
+            rules_converter.write_clash_single(rules, output)
+            self.assertEqual(
+                output.read_text(encoding="utf-8").splitlines(),
+                ["rules:", '  - "MATCH,PROXY"', '  - "MATCH,REJECT"'],
+            )
+
+    def test_yaml_extension_is_inferred_as_clash_single(self) -> None:
+        self.assertEqual(
+            rules_converter.infer_input_format(Path("rules.yml")),
+            "clash-single",
+        )
+        self.assertEqual(
+            rules_converter.infer_output_format(Path("rules.yaml")),
+            "clash-single",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

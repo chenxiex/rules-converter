@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert between xray, routingA, switchy, simple-switchy, and clash formats.
+"""Convert xray rules among routingA, switchy, and Mihomo formats.
 
 xray format:
     JSON list of rule objects.
@@ -18,6 +18,10 @@ simple-switchy format (.sorl):
 clash format (output only):
     An output directory containing one outboundTag.yaml file per outbound tag.
     Each file is a Mihomo classical rule-provider YAML file without policy fields.
+
+clash-single format:
+    A single Mihomo YAML file with a top-level rules list. The outboundTag is
+    mapped to the policy (normally the third field) of every routing rule.
 """
 
 from __future__ import annotations
@@ -511,6 +515,20 @@ CLASH_IGNORED_RULE_KEYS = {
 }
 
 
+XRAY_OUTBOUND_TO_CLASH_POLICY = {
+    "direct": "DIRECT",
+    "block": "REJECT",
+    "proxy": "PROXY",
+}
+
+CLASH_POLICY_TO_XRAY_OUTBOUND = {
+    "DIRECT": "direct",
+    "REJECT": "block",
+    "REJECT-DROP": "block",
+    "PROXY": "proxy",
+}
+
+
 def value_list(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(item) for item in value]
@@ -739,6 +757,283 @@ def write_clash(rules: list[dict[str, Any]], output_path: Path) -> None:
         yaml_path.write_text("\n".join(yaml_lines) + "\n", encoding="utf-8")
 
 
+def outbound_tag_to_clash_policy(outbound_tag: str) -> str:
+    return XRAY_OUTBOUND_TO_CLASH_POLICY.get(outbound_tag, outbound_tag)
+
+
+def clash_policy_to_outbound_tag(policy: str) -> str:
+    return CLASH_POLICY_TO_XRAY_OUTBOUND.get(policy, policy)
+
+
+def split_clash_fields(text: str) -> list[str]:
+    """Split a Mihomo rule on commas outside logical-rule parentheses."""
+    fields: list[str] = []
+    start = 0
+    depth = 0
+    for index, char in enumerate(text):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth < 0:
+                raise ValueError(f"unbalanced parentheses in Clash rule: {text}")
+        elif char == "," and depth == 0:
+            fields.append(text[start:index].strip())
+            start = index + 1
+    if depth != 0:
+        raise ValueError(f"unbalanced parentheses in Clash rule: {text}")
+    fields.append(text[start:].strip())
+    return fields
+
+
+def strip_wrapping_parentheses(text: str) -> str:
+    result = text.strip()
+    while result.startswith("(") and result.endswith(")"):
+        depth = 0
+        closes_at_end = False
+        for index, char in enumerate(result):
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    closes_at_end = index == len(result) - 1
+                    break
+        if not closes_at_end:
+            break
+        result = result[1:-1].strip()
+    return result
+
+
+def strip_one_wrapping_parenthesis_pair(text: str) -> str:
+    result = text.strip()
+    if not (result.startswith("(") and result.endswith(")")):
+        raise ValueError(f"expected parenthesized Clash logic payload: {text}")
+    return result[1:-1].strip()
+
+
+def clash_leaf_to_conditions(rule_type: str, payload: str) -> dict[str, list[str]]:
+    domain_prefixes = {
+        "DOMAIN": "full:",
+        "DOMAIN-SUFFIX": "domain:",
+        "DOMAIN-KEYWORD": "keyword:",
+        "DOMAIN-REGEX": "regexp:",
+        "GEOSITE": "geosite:",
+    }
+    if rule_type in domain_prefixes:
+        return {"domain": [domain_prefixes[rule_type] + payload]}
+
+    if rule_type in {"IP-CIDR", "IP-CIDR6"}:
+        return {"ip": [payload]}
+    if rule_type == "GEOIP":
+        return {"ip": [f"geoip:{payload.lower()}"]}
+    if rule_type == "SRC-IP-CIDR":
+        return {"source": [payload]}
+    if rule_type == "SRC-GEOIP":
+        return {"source": [f"geoip:{payload.lower()}"]}
+
+    simple_types = {
+        "DST-PORT": "port",
+        "SRC-PORT": "sourcePort",
+        "IN-PORT": "localPort",
+        "NETWORK": "network",
+        "IN-USER": "user",
+        "IN-NAME": "inboundTag",
+        "PROCESS-PATH": "process",
+    }
+    key = simple_types.get(rule_type)
+    if key is not None:
+        value = payload.replace("/", ",") if rule_type.endswith("PORT") else payload
+        return {key: [value]}
+
+    raise ValueError(f"unsupported Clash rule type: {rule_type}")
+
+
+def merge_clash_conditions(
+    operator: str,
+    children: list[dict[str, list[str]]],
+) -> dict[str, list[str]]:
+    if not children:
+        raise ValueError(f"empty {operator} Clash rule")
+
+    if operator == "OR":
+        keys = {key for child in children for key in child}
+        if len(keys) != 1 or any(len(child) != 1 for child in children):
+            raise ValueError("OR rule cannot be represented as one Xray rule")
+        key = next(iter(keys))
+        return {key: deduplicate([value for child in children for value in child[key]])}
+
+    merged: dict[str, list[str]] = {}
+    for child in children:
+        for key, values in child.items():
+            if key not in merged:
+                merged[key] = list(values)
+                continue
+            combined = merged[key] + values
+            if key in {"ip", "source"} and all(
+                value.startswith("!") for value in combined
+            ):
+                merged[key] = deduplicate(combined)
+                continue
+            raise ValueError("AND rule contains conditions that cannot be represented in Xray")
+    return merged
+
+
+def clash_clause_to_conditions(text: str) -> dict[str, list[str]]:
+    expression = strip_wrapping_parentheses(text)
+    fields = split_clash_fields(expression)
+    if len(fields) != 2:
+        raise ValueError(f"invalid Clash rule condition: {text}")
+
+    rule_type = fields[0].upper()
+    payload = fields[1]
+    if rule_type not in {"AND", "OR", "NOT"}:
+        return clash_leaf_to_conditions(rule_type, payload)
+
+    inner = strip_one_wrapping_parenthesis_pair(payload)
+    child_texts = split_clash_fields(inner)
+    children = [clash_clause_to_conditions(child) for child in child_texts]
+    if rule_type == "NOT":
+        if len(children) != 1 or set(children[0]) not in ({"ip"}, {"source"}):
+            raise ValueError("NOT rule cannot be represented as one Xray rule")
+        key = next(iter(children[0]))
+        values = children[0][key]
+        if len(values) != 1 or values[0].startswith("!"):
+            raise ValueError("nested NOT rule cannot be represented in Xray")
+        return {key: [f"!{values[0]}"]}
+    return merge_clash_conditions(rule_type, children)
+
+
+def parse_clash_single_rule(text: str) -> dict[str, Any]:
+    fields = split_clash_fields(text)
+    if not fields or not fields[0]:
+        raise ValueError("empty Clash rule")
+
+    rule_type = fields[0].upper()
+    if rule_type == "MATCH":
+        if len(fields) != 2 or not fields[1]:
+            raise ValueError(f"invalid MATCH rule: {text}")
+        conditions: dict[str, Any] = {}
+        policy = fields[1]
+    else:
+        if len(fields) < 3 or not fields[2]:
+            raise ValueError(f"Clash rule is missing its policy field: {text}")
+        conditions = dict(clash_clause_to_conditions(",".join(fields[:2])))
+        policy = fields[2]
+
+    for scalar_key in {"port", "sourcePort", "localPort", "network"}:
+        values = conditions.get(scalar_key)
+        if values is not None and len(values) == 1:
+            conditions[scalar_key] = values[0]
+
+    rule: dict[str, Any] = {
+        "outboundTag": clash_policy_to_outbound_tag(policy),
+        **conditions,
+        "enabled": True,
+    }
+    return rule
+
+
+def parse_yaml_rule_scalar(raw: str) -> str:
+    value = raw.strip()
+    if value.startswith('"'):
+        try:
+            parsed, end = json.JSONDecoder().raw_decode(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid double-quoted YAML rule: {value}") from exc
+        if not isinstance(parsed, str):
+            raise ValueError(f"YAML rule must be a string: {value}")
+        trailing = value[end:].strip()
+        if trailing and not trailing.startswith("#"):
+            raise ValueError(f"unexpected text after YAML rule: {trailing}")
+        return parsed
+    if value.startswith("'"):
+        index = 1
+        parsed_chars: list[str] = []
+        while index < len(value):
+            if value[index] != "'":
+                parsed_chars.append(value[index])
+                index += 1
+                continue
+            if index + 1 < len(value) and value[index + 1] == "'":
+                parsed_chars.append("'")
+                index += 2
+                continue
+            trailing = value[index + 1 :].strip()
+            if trailing and not trailing.startswith("#"):
+                raise ValueError(f"unexpected text after YAML rule: {trailing}")
+            return "".join(parsed_chars)
+        raise ValueError(f"invalid single-quoted YAML rule: {value}")
+    return re.split(r"\s+#", value, maxsplit=1)[0].rstrip()
+
+
+def read_clash_single(input_path: Path) -> list[dict[str, Any]]:
+    yaml_lines = input_path.read_text(encoding="utf-8").splitlines()
+    rules_start: int | None = None
+    for index, raw in enumerate(yaml_lines):
+        if re.fullmatch(r"rules:\s*(?:#.*)?", raw):
+            rules_start = index
+            break
+    if rules_start is None:
+        raise ValueError(f"{input_path}: missing top-level rules list")
+
+    rules: list[dict[str, Any]] = []
+    for index in range(rules_start + 1, len(yaml_lines)):
+        raw = yaml_lines[index]
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        item = raw.lstrip()
+        if not item.startswith("-") and not raw[0].isspace():
+            break
+        if not item.startswith("-"):
+            raise ValueError(f"{input_path}:{index + 1}: expected a rules list item")
+        scalar = parse_yaml_rule_scalar(item[1:].lstrip())
+        try:
+            rules.append(parse_clash_single_rule(scalar))
+        except ValueError as exc:
+            raise ValueError(f"{input_path}:{index + 1}: {exc}") from exc
+    return rules
+
+
+def is_clash_single_match_all_rule(rule: dict[str, Any]) -> bool:
+    conditions = {
+        key: value
+        for key, value in rule.items()
+        if key not in CLASH_IGNORED_RULE_KEYS
+    }
+    if not conditions:
+        return True
+    if set(conditions) == {"port"}:
+        return is_dst_port_catch_all(conditions["port"])
+    if set(conditions) == {"all"}:
+        return not value_list(conditions["all"])
+    return False
+
+
+def write_clash_single(rules: list[dict[str, Any]], output_path: Path) -> None:
+    yaml_lines = ["rules:"]
+    for i, rule in enumerate(rules, start=1):
+        if not isinstance(rule, dict):
+            raise ValueError(f"Rule #{i} must be an object")
+        if rule.get("enabled", True) is False:
+            continue
+
+        outbound_tag = rule.get("outboundTag")
+        if not isinstance(outbound_tag, str) or not outbound_tag:
+            raise ValueError(f"Rule #{i} must include non-empty outboundTag")
+        policy = outbound_tag_to_clash_policy(outbound_tag)
+
+        clash_lines = xray_rule_to_clash_lines(rule)
+        if not clash_lines and is_clash_single_match_all_rule(rule):
+            clash_lines = ["MATCH"]
+        yaml_lines.extend(
+            f"  - {json.dumps(f'{line},{policy}', ensure_ascii=False)}"
+            for line in clash_lines
+        )
+    output_path.write_text("\n".join(yaml_lines) + "\n", encoding="utf-8")
+
+
 def detect_text_format(input_path: Path) -> str:
     lines = input_path.read_text(encoding="utf-8").splitlines()
     for raw in lines:
@@ -759,6 +1054,8 @@ def infer_input_format(input_path: Path) -> str:
     ext = input_path.suffix.lower()
     if ext == ".json":
         return "xray"
+    if ext in {".yaml", ".yml"}:
+        return "clash-single"
     if ext == ".sorl":
         return "simple-switchy"
     if ext == ".txt":
@@ -770,6 +1067,8 @@ def infer_output_format(output_path: Path) -> str:
     ext = output_path.suffix.lower()
     if ext == ".json":
         return "xray"
+    if ext in {".yaml", ".yml"}:
+        return "clash-single"
     if ext == ".sorl":
         return "simple-switchy"
     if ext == ".txt":
@@ -789,6 +1088,8 @@ def read_rules(input_path: Path, fmt: str) -> list[dict[str, Any]]:
         return read_switchy(input_path)
     if fmt == "simple-switchy":
         return read_simple_switchy(input_path)
+    if fmt == "clash-single":
+        return read_clash_single(input_path)
     raise ValueError(f"Unsupported input format: {fmt}")
 
 
@@ -808,6 +1109,9 @@ def write_rules(rules: list[dict[str, Any]], output_path: Path, fmt: str) -> Non
     if fmt == "clash":
         write_clash(rules, output_path)
         return
+    if fmt == "clash-single":
+        write_clash_single(rules, output_path)
+        return
     raise ValueError(f"Unsupported output format: {fmt}")
 
 
@@ -823,14 +1127,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Convert between xray, routingA, switchy, simple-switchy, "
-            "and clash formats"
+            "clash, and clash-single formats"
         )
     )
     parser.add_argument("input", help="Input file path")
     parser.add_argument("output", help="Output file path, or directory for clash")
     parser.add_argument(
         "--from-format",
-        choices=["auto", "xray", "routingA", "switchy", "simple-switchy"],
+        choices=[
+            "auto",
+            "xray",
+            "routingA",
+            "switchy",
+            "simple-switchy",
+            "clash-single",
+        ],
         default="auto",
         help="Input format (default: auto)",
     )
@@ -843,9 +1154,13 @@ def build_parser() -> argparse.ArgumentParser:
             "switchy",
             "simple-switchy",
             "clash",
+            "clash-single",
         ],
         default="auto",
-        help="Output format; clash writes outboundTag.yaml files to a directory",
+        help=(
+            "Output format; clash writes outboundTag.yaml files to a directory, "
+            "clash-single writes one Mihomo rules YAML file"
+        ),
     )
     return parser
 
